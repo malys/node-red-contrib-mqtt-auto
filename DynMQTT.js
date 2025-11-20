@@ -242,7 +242,7 @@ module.exports = class DynMQTT {
 
     async publish(topic, payload, options) {
         if (this.status === "connected") {
-            let send_payload = JSON.stringify(payload);
+            let send_payload = String(payload);
             
             await this.connection.publishAsync(topic, send_payload, options);
             return true;
