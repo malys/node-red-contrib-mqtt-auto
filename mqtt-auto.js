@@ -58,35 +58,38 @@ const main = function (RED) {
     RED.nodes.registerType("mqtt-auto-subscribe", function (config) {
         RED.nodes.createNode(this, config);
         var node = this;
-        // Clients this node subscribed on, to clean up on redeploy
-        const usedClients = new Set();
-
         node.on('input', async function (msg, send, done) {
             let client = DynMQTT.getClient(msg.client_id);
             if (client) {
-                usedClients.add(msg.client_id);
                 let topics = [msg.topic].flat()
+                const nodeId = node.id;
+                const failed = [];
                 for (let t of topics) {
                     // -- actualTopic contains the real topic the message was received at (no wildards)
                     // -- node.id as owner: re-subscribing replaces this node's callback
-                    await client.subscribe(t, function (actualTopic, message) {
-                        node.send({
+                    // -- node looked up at delivery: a redeployed node (same id) keeps receiving
+                    let ok = await client.subscribe(t, function (actualTopic, message) {
+                        const target = RED.nodes.getNode(nodeId);
+                        if (target) target.send({
                             "payload": destr(message.toString()),
                             "client_id": client.client_id,
                             "topic": actualTopic
                         })
-                    }, node.id)
+                    }, nodeId)
+                    if (!ok) failed.push(t);
                 }
-                done();
+                done(failed.length ? "Subscription failed: " + failed.join(", ") : undefined);
             } else
                 done("Client " + msg.client_id + " for Subscription not known!");
         });
 
-        // Redeploy/stop: drop this node's callbacks so no message is sent to a dead node
-        node.on('close', async function (done) {
-            for (const id of usedClients) {
-                const client = DynMQTT.getClient(id);
-                if (client) await client.unsubscribeOwner(node.id).catch(() => { });
+        // Deleted node: drop its callbacks. Redeployed/restarted node: keep them,
+        // the new instance (same id) receives through RED.nodes.getNode.
+        // Broker unsubscribe is not awaited: it never settles while offline.
+        node.on('close', function (removed, done) {
+            if (removed) {
+                for (const client of Object.values(DynMQTT.clients))
+                    client.unsubscribeOwner(node.id).catch(() => { });
             }
             done();
         });

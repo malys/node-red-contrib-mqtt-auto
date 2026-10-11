@@ -8,7 +8,7 @@
   },
   "main": "mqtt-auto.js",
   "scripts": {
-    "test": "echo \"Error: No Test\" && exit 1"
+    "test": "node DynMQTT.test.js"
   },
   "repository": {
     "type": "git",

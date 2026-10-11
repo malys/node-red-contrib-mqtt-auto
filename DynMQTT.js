@@ -26,11 +26,6 @@ module.exports = class DynMQTT {
         return subscriptions.filter(s => DynMQTT.topicMatches(s, received));
     }
 
-    // --- Kept for backward compatibility: first matching filter or false
-    static findTopic(received, subscriptions) {
-        return DynMQTT.findTopics(received, subscriptions)[0] || false;
-    }
-
     static closeClients() {
         for (const [id, client] of Object.entries(DynMQTT.clients)) {
             client.close();
@@ -39,7 +34,7 @@ module.exports = class DynMQTT {
     }
 
     static closeClient(id) {
-        let client = this.getConnectedClient(id)
+        let client = this.getClient(id)
         if (client) {
             client.close();
             delete DynMQTT.clients[id];
@@ -52,29 +47,26 @@ module.exports = class DynMQTT {
     static createClient(config, status_callback) {
         const client_id = config.payload.client_id;
         const existing = this.getClient(client_id);
-        // A client that is connected or still (re)connecting is reused:
-        // replacing it would drop its subscriptions.
-        if (existing && existing.status !== "closed" && existing.status !== "error") {
-            console.info(`MQTT: Client already exists (${existing.status}): ${client_id}`);
+        // A connected client with the same settings is reused. Otherwise (new
+        // credentials/host, or still reconnecting) it is replaced and its
+        // subscriptions are carried over.
+        if (existing && existing.status === "connected" && existing.settings === JSON.stringify(config.payload)) {
+            console.info(`MQTT: Client already connected: ${client_id}`);
             existing.status_callback = status_callback;
             return existing;
         }
         console.info(`MQTT: Creating new client: ${client_id}`);
         const client = new DynMQTT(client_id, config.payload, status_callback);
         if (existing) {
-            // Carry the subscriptions over; they are re-sent on 'connect'
             client.subscriptions = existing.subscriptions;
             existing.subscriptions = {};
             existing.connection.end(true);
+            // Queued by mqtt.js until 'connect'
+            for (const topic of Object.keys(client.subscriptions))
+                client.connection.subscribe(topic, err => err && console.error(`MQTT: resubscribe ${topic}: ${err}`));
         }
         DynMQTT.clients[client_id] = client;
         return client;
-    }
-
-    static getConnectedClient(client_id) {
-        let client = this.getClient(client_id);
-        if (client && client.status == "connected") return client;
-        return false;
     }
 
     static listClients() {
@@ -108,9 +100,11 @@ module.exports = class DynMQTT {
         this.cert_path = config.cert || false;
         this.ca_path = config.ca || false;
 
+        this.settings = JSON.stringify(config);
         // README documents reconnect_t (0 = off, 1 = on); values > 1 are a period in ms
-        const reconnect = config.reconnect_t ?? config.reconnect ?? 0;
-        this.reconnect_t = reconnect ? (reconnect > 1 ? reconnect : 1000) : 0;
+        let reconnect = config.reconnect_t ?? config.reconnect ?? 0;
+        reconnect = (reconnect === true || reconnect === 'true') ? 1 : Number(reconnect) || 0;
+        this.reconnect_t = reconnect > 1 ? reconnect : (reconnect === 1 ? 1000 : 0);
         this.rap = config.rap || true; // Retain as Published MQTT 5.0 flag
         this.rh = config.rh || true; //Retain Handling MQTT 5.0 
 
@@ -143,10 +137,6 @@ module.exports = class DynMQTT {
         /*Client events*/
         this.connection.on('connect', () => {
             this.change_status("connected");
-            // Re-send every known filter (new client or broker without session)
-            for (let topic of Object.keys(this.subscriptions)) {
-                this.connection.subscribeAsync(topic).catch(err => console.error(`MQTT: resubscribe ${topic}: ${err}`));
-            }
             //this.status_callback({ summary: { fill: "green", shape: "dot", text: "Connected" } });
         });
 
@@ -173,7 +163,7 @@ module.exports = class DynMQTT {
         });
 
         // 'close' also fires before each reconnection: subscriptions are kept
-        // and re-sent on 'connect'. They are only cleared by close().
+        // (mqtt.js re-sends them on reconnect). They are only cleared by close().
         this.connection.on('close', () => {
             this.change_status("closed");
         });
@@ -181,10 +171,15 @@ module.exports = class DynMQTT {
         this.connection.on('message', (topic, message) => {
             const filters = DynMQTT.findTopics(topic, Object.keys(this.subscriptions));
             if (filters.length) {
+                // An owner subscribed to overlapping filters gets the message once.
+                // ponytail: a broker may still send one copy per matching filter
+                // (mosquitto does); MQTT 5 subscription identifiers would dedupe them.
+                const callbacks = new Map();
                 for (const f of filters)
-                    for (const cb of this.subscriptions[f].values()) {
-                        try { cb(topic, message); } catch (err) { console.error(`MQTT: callback ${f}: ${err}`); }
-                    }
+                    for (const [owner, cb] of this.subscriptions[f]) callbacks.set(owner, cb);
+                for (const cb of callbacks.values()) {
+                    try { cb(topic, message); } catch (err) { console.error(`MQTT: callback ${topic}: ${err}`); }
+                }
             } else {
                 console.error(`MQTT: Rec msg w/o subscription on ${topic}`);
             }
@@ -237,23 +232,24 @@ module.exports = class DynMQTT {
     // subscriptions = { filter: Map(owner -> callback) }
     // owner identifies the subscriber (Node-RED node id): a node re-subscribing
     // replaces its own callback instead of being ignored.
-    async subscribe(topic, callback, owner = 'default') {
+    // Resolves true once the broker granted the filter, false on failure.
+    subscribe(topic, callback, owner = 'default') {
         let owners = this.subscriptions[topic];
-        if (owners) {
-            owners.set(owner, callback);
-            console.info(`MQTT: ${topic} already subscribed, callback updated for ${owner}`);
-            return;
+        if (!owners) {
+            owners = this.subscriptions[topic] = new Map();
+            // Shared by every owner subscribing while the SUBACK is pending
+            owners.ready = this.connection.subscribeAsync(topic).then(grantedList => {
+                console.info(`MQTT: Subscribed to: ${grantedList[0] ? grantedList[0].topic : topic}`);
+                this.change_status(this.status);
+                return true;
+            }, err => {
+                console.error(`MQTT: ${err}`);
+                if (this.subscriptions[topic] === owners) delete this.subscriptions[topic];
+                return false;
+            });
         }
-        owners = new Map([[owner, callback]]);
-        this.subscriptions[topic] = owners;
-        try {
-            let grantedList = await this.connection.subscribeAsync(topic);
-            console.info(`MQTT: Subscribed to: ${grantedList[0] ? grantedList[0].topic : topic}`);
-            this.change_status(this.status);
-        } catch (err) {
-            console.error(`MQTT: ${err}`);
-            if (this.subscriptions[topic] === owners) delete this.subscriptions[topic];
-        }
+        owners.set(owner, callback);
+        return owners.ready;
     }
 
     // Without owner: removes the filter for everyone.
@@ -280,11 +276,12 @@ module.exports = class DynMQTT {
         }
     }
 
-    // Removes every callback of an owner (called when a node is closed/redeployed)
-    async unsubscribeOwner(owner) {
-        for (const [topic, owners] of Object.entries(this.subscriptions)) {
-            if (owners.has(owner)) await this.unsubscribe(topic, owner);
-        }
+    // Removes every callback of an owner (called when a node is deleted).
+    // Callbacks are dropped synchronously; the returned promise only tracks the broker.
+    unsubscribeOwner(owner) {
+        return Promise.all(Object.entries(this.subscriptions)
+            .filter(([, owners]) => owners.has(owner))
+            .map(([topic]) => this.unsubscribe(topic, owner)));
     }
 
     async publish(topic, payload, options) {

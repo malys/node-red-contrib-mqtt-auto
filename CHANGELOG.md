@@ -5,13 +5,16 @@
 ### Fixed
 
 * fix: re-subscribing (redeploy) replaced nothing: messages went to the closed node. Callbacks are now owned by the node id and replaced
-* fix: subscribe node removes its callbacks on close
 * fix: a filter covered by an existing one (e.g. `a/b` under `a/+`) was silently ignored
-* fix: subscriptions were dropped on every connection `close` (including before a reconnection); they are now re-sent on `connect`
-* fix: `reconnect_t` (documented) was ignored, only `reconnect` was read: auto-reconnect never enabled
-* fix: connect on an existing reconnecting client replaced it and lost its subscriptions
+* fix: subscriptions were dropped on every connection `close` (including before a reconnection); mqtt.js now restores them on reconnect
+* fix: `reconnect_t` (documented) was ignored, only `reconnect` was read: auto-reconnect never enabled. `"0"`/`"false"` keep it off
+* fix: connect on an existing client lost its subscriptions; they are carried over to the new client
+* fix: connect with new settings (host, credentials...) replaces the client, even while it is reconnecting; same settings on a connected client reuse it
+* fix: disconnect also stops an offline/reconnecting client
 * fix: topic matching interpreted regex characters (`.`); now level-by-level MQTT matching
-* fix: a message is delivered to every matching filter, not only the first
+* fix: a message is delivered to every matching filter, once per subscribe node
+* fix: subscribe node reports subscription failures (also to nodes waiting on the same pending subscription)
+* fix: a redeployed subscribe node keeps its subscriptions; a deleted one drops them without waiting for the broker
 
 ## [v2.2.0] - 2025-02-05
 
