@@ -1,5 +1,18 @@
 # Changelog
 
+## [v2.3.0] - 2026-10-11
+
+### Fixed
+
+* fix: re-subscribing (redeploy) replaced nothing: messages went to the closed node. Callbacks are now owned by the node id and replaced
+* fix: subscribe node removes its callbacks on close
+* fix: a filter covered by an existing one (e.g. `a/b` under `a/+`) was silently ignored
+* fix: subscriptions were dropped on every connection `close` (including before a reconnection); they are now re-sent on `connect`
+* fix: `reconnect_t` (documented) was ignored, only `reconnect` was read: auto-reconnect never enabled
+* fix: connect on an existing reconnecting client replaced it and lost its subscriptions
+* fix: topic matching interpreted regex characters (`.`); now level-by-level MQTT matching
+* fix: a message is delivered to every matching filter, not only the first
+
 ## [v2.2.0] - 2025-02-05
 
 ### Added
